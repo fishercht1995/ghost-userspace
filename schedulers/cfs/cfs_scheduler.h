@@ -14,6 +14,12 @@
 #include <ostream>
 #include <set>
 
+#include <fstream>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/file.h>
+
+
 #include "absl/container/flat_hash_map.h"
 #include "absl/functional/any_invocable.h"
 #include "absl/strings/str_format.h"
@@ -28,6 +34,76 @@ static const absl::Time start = absl::Now();
 
 namespace ghost {
 
+inline std::map<int, int64_t> timeslice = {
+    {0, 8000},
+    {1, 200000},
+    {2, 100000},
+    {3, 10000},
+    {4, 8000},
+    {5, 8000}
+};
+/*
+inline int readValue(int fileName) {
+    std::string filename = "/tidinfo/" + std::to_string(fileName) + ".txt"; // 构造文件路径
+    std::ifstream inputFile(filename);
+    int number = 0;
+    try {
+        if (inputFile.is_open()) {
+            std::string data;
+            inputFile >> data;
+            number = std::stoi(data); // 尝试将字符串转换为整数
+            inputFile.close();
+        } else {
+            std::cerr << "open file error\n";
+        }
+    } catch (const std::invalid_argument& e) {
+        std::cerr << "\nInvalid data in the file: " << e.what();
+        number = 0;
+    }
+}
+*/
+
+inline int readValue(int fileName) {
+    std::string filename = "/tidinfo/" + std::to_string(fileName) + ".txt"; // 构造文件路径
+
+    int fileDescriptor = open(filename.c_str(), O_RDONLY);
+    if (fileDescriptor == -1) {
+        std::cerr << "Error opening file." << std::endl;
+        return 0;
+    }
+
+    // 请求共享锁（读取锁）
+    if (flock(fileDescriptor, LOCK_SH) == -1) {
+        std::cerr << "Error locking file for reading." << std::endl;
+        close(fileDescriptor);
+        return 0;
+    }
+
+    int number = 0;
+    try {
+        std::ifstream inputFile(filename);
+        if (inputFile.is_open()) {
+            std::string data;
+            inputFile >> data;
+            number = std::stoi(data); // 尝试将字符串转换为整数
+            inputFile.close();
+        } else {
+            std::cerr << "Open file error\n";
+        }
+    } catch (const std::invalid_argument& e) {
+        std::cerr << "\nInvalid data in the file: " << e.what();
+        number = 0;
+    }
+
+    // 释放锁
+    if (flock(fileDescriptor, LOCK_UN) == -1) {
+        std::cerr << "Error unlocking file after reading." << std::endl;
+    }
+
+    close(fileDescriptor);
+
+    return number;
+}
 // We could use just "enum class", but embedding an enum (which is implicitly
 // convertable to an int) makes a lot of the debugging code simpler. We could do
 // some hackery like static_cast<typename
@@ -80,7 +156,6 @@ class CfsTaskState {
   // Convenience functions for accessing on_rq state.
   inline bool OnRqQueued() const { return on_rq_ == OnRq::kQueued; }
   inline bool OnRqMigrating() const { return on_rq_ == OnRq::kMigrating; }
-  inline bool OnRqDequeued() const { return on_rq_ == OnRq::kDequeued; }
 
   // Accessors.
   State GetState() const { return state_; }
@@ -219,10 +294,32 @@ struct CfsTask : public Task<> {
   // function as a template parameter. Technically, this doesn't have to be
   // inside of the struct, but it seems logical to keep this here.
   static bool Less(CfsTask* a, CfsTask* b) {
-    if (a->vruntime == b->vruntime) {
-      return (uintptr_t)a < (uintptr_t)b;
+    //read priority of task a and task b;
+    int pa = 0;
+    int pb = 0;
+    pa = a->seal_prio;
+    pb = b->seal_prio;
+    //printf("taska %d, taskb %d\n", pa, pb);
+    if (pa == 0){
+      pa = readValue((a->gtid).tid());
     }
-    return a->vruntime < b->vruntime;
+    if (pb == 0){
+      pb = readValue((b->gtid).tid());
+    }
+    //if(a){
+    //  pa = readValue((a->gtid).tid());
+    //}
+    //if(b){
+    //  pb = readValue((b->gtid).tid());
+    //}
+    if (pa != pb){
+      return pa < pb;
+    }else{
+      if (a->vruntime == b->vruntime) {
+        return (uintptr_t)a < (uintptr_t)b;
+      }
+      return a->vruntime < b->vruntime;
+    }
   }
 
   CfsTaskState task_state =
@@ -244,6 +341,9 @@ struct CfsTask : public Task<> {
   // has been running.
   absl::Duration vruntime;
 
+  //
+  uint64_t runtime_at_current_time_slice = 0;
+  int seal_prio = 0;
   // runtime_at_first_pick is how much runtime this task had at its initial
   // picking. This timestamp does not change unless we are put back in the
   // runqueue. IOW, if we bounce between oncpu and put_prev_task_elision_,
@@ -285,6 +385,9 @@ class CfsRq {
   // prev. PickNextTask sets the state of its returned task to kOnCpu.
   CfsTask* PickNextTask(CfsTask* prev, TaskAllocator<CfsTask>* allocator,
                         CpuState* cs) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+  
+  CfsTask* PickNextTaskSEALs(CfsTask* prev, TaskAllocator<CfsTask>* allocator,
+                        CpuState* cs, int seals_break) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
 
   // Enqueues a new task or a task that is coming from being blocked.
   void EnqueueTask(CfsTask* task) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
@@ -425,8 +528,8 @@ struct CpuState {
   // ID of the cpu.
   int id = -1;
 
-  bool IsIdle() const { return current == nullptr; }
-  bool LocklessRqEmpty() const { return run_queue.LocklessSize() == 0; }
+  bool IsIdle() { return current == nullptr; }
+  bool LocklessRqEmpty() { return run_queue.LocklessSize() == 0; }
 } ABSL_CACHELINE_ALIGNED;
 
 class CfsScheduler : public BasicDispatchScheduler<CfsTask> {
@@ -509,7 +612,7 @@ class CfsScheduler : public BasicDispatchScheduler<CfsTask> {
   void DumpState(const Cpu& cpu, int flags) final;
   std::atomic<bool> debug_runqueue_ = false;
 
-  int CountAllTasks() const {
+  int CountAllTasks() {
     int num_tasks = 0;
     allocator()->ForEachTask([&num_tasks](Gtid gtid, const CfsTask* task) {
       ++num_tasks;
@@ -544,11 +647,10 @@ class CfsScheduler : public BasicDispatchScheduler<CfsTask> {
   // Note: Should be called with this CPU's rq mutex lock held.
   void CheckPreemptTick(const Cpu& cpu);
 
-  // Kicks a given task off-cpu and puts into this CPU's run queue or initiate
-  // its migration if this CPU is no longer eligible as per its affinity mask.
-  // If the task was on-cpu (cs->current == task), cs->current will be reset as
-  // a side effect.
-  void PutPrevTask(CfsTask* task);
+  // Kicks the current task off-cpu and puts into this CPU's run queue or
+  // initiate its migration if this CPU is no longer eligible as per its
+  // affinity mask.
+  void PutPrevTask();
 
   // CfsSchedule looks at the current cpu state and its run_queue, decides what
   // to run next, and then commits a txn. REQUIRES: Called after all messages
